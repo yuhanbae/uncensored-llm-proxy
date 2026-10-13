@@ -52,13 +52,21 @@ class Proxy(http.server.BaseHTTPRequestHandler):
     def _passthrough(self, include_body=False):
         length = int(self.headers.get("Content-Length") or 0) if include_body else 0
         body = self.rfile.read(length) if include_body else None
+        # Path mapping: the public face carries a /v1 prefix (BASE=".../v1"), but
+        # llama-server only serves OpenAI endpoints under /v1. Other /v1/* paths
+        # (e.g. /v1/props) map to the bare root endpoint (/props).
+        path = self.path
+        OPENAI_V1 = ("/v1/chat/completions", "/v1/completions", "/v1/models",
+                     "/v1/embeddings", "/v1/responses", "/v1/rerank", "/v1/reranking")
+        if path.startswith("/v1/") and not path.startswith(OPENAI_V1):
+            path = path[3:]  # /v1/props -> /props
         attempts = 0
         while attempts < 2:
             upstream = resolve_upstream(force=(attempts > 0))
             try:
                 fwd = {k: v for k, v in self.headers.items()
                        if k.lower() not in ("host", "content-length", "connection", "transfer-encoding")}
-                conn, resp = fetch(upstream, self.command, self.path, body=body, headers=fwd)
+                conn, resp = fetch(upstream, self.command, path, body=body, headers=fwd)
             except Exception as e:
                 attempts += 1
                 if attempts >= 2:
@@ -71,7 +79,8 @@ class Proxy(http.server.BaseHTTPRequestHandler):
                     return
                 continue
             status = resp.getcode()
-            if status in (502, 530, 524, 404) and attempts == 0:
+            # retry only on tunnel-rotation/infra errors, never on client errors
+            if status in (502, 530, 524) and attempts == 0:
                 try:
                     resp.close()
                 except Exception:
