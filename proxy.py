@@ -3,6 +3,10 @@
 
 - Resolves the current trycloudflare URL from the GitHub Gist on every request
   (60s cache, bypassed on upstream errors).
+- Model-based routing: POST bodies whose "model" contains an abliterated marker
+  (ablit/dolphin/venice/heretic) are routed to the second upstream published in
+  gist file url-ablit.txt (serve-ablit.yml workflow); everything else goes to
+  the default upstream (url.txt).
 - Streams SSE chat completions through unchanged.
 - Passes through /v1/models, /v1/models/<id>, /props, /health.
 Env: GIST_TOKEN (GitHub PAT), GIST_ID, PORT (Railway sets PORT)
@@ -14,23 +18,43 @@ GIST_ID = os.environ.get("GIST_ID", "7ec01cb438fa7f501847b725ed44063a")
 PORT = int(os.environ.get("PORT", "8080"))
 TTL = 60
 
-_cache = {"url": None, "ts": 0.0}
+# model-id markers -> gist file holding that slot's tunnel URL
+SLOTS = {
+    "default": "url.txt",
+    "ablit": "url-ablit.txt",
+}
+ABLIT_MARKERS = ("ablit", "dolphin", "venice", "heretic")
+
+_cache = {slot: {"url": None, "ts": 0.0} for slot in SLOTS}
 _lock = threading.Lock()
 
-def resolve_upstream(force=False):
+def route_slot(body):
+    """Pick the gist file for a request body (parsed JSON or None)."""
+    if not body:
+        return "default"
+    try:
+        model = str(json.loads(body).get("model", "")).lower()
+    except Exception:
+        return "default"
+    return "ablit" if any(m in model for m in ABLIT_MARKERS) else "default"
+
+def resolve_upstream(slot="default", force=False):
     with _lock:
         now = time.time()
-        if not force and _cache["url"] and now - _cache["ts"] < TTL:
-            return _cache["url"]
+        c = _cache[slot]
+        if not force and c["url"] and now - c["ts"] < TTL:
+            return c["url"]
         req = urllib.request.Request(
             f"https://api.github.com/gists/{GIST_ID}",
             headers={"Authorization": f"Bearer {GIST_TOKEN}", "User-Agent": "railway-proxy"})
         with urllib.request.urlopen(req, timeout=15) as r:
             gist = json.loads(r.read().decode())
-        url = gist["files"]["url.txt"]["content"].strip().rstrip("/")
+        fname = SLOTS.get(slot, "url.txt")
+        entry = gist["files"].get(fname)
+        url = (entry or {}).get("content", "").strip().rstrip("/") if entry else ""
         if not url.startswith("https://"):
-            raise RuntimeError("bad gist url")
-        _cache["url"], _cache["ts"] = url, now
+            raise RuntimeError(f"bad/missing gist url for slot {slot}")
+        c["url"], c["ts"] = url, now
         return url
 
 def fetch(upstream, method, path, body=None, headers=None, timeout=900):
@@ -52,6 +76,7 @@ class Proxy(http.server.BaseHTTPRequestHandler):
     def _passthrough(self, include_body=False):
         length = int(self.headers.get("Content-Length") or 0) if include_body else 0
         body = self.rfile.read(length) if include_body else None
+        slot = route_slot(body)
         # Path mapping: the public face carries a /v1 prefix (BASE=".../v1"), but
         # llama-server only serves OpenAI endpoints under /v1. Other /v1/* paths
         # (e.g. /v1/props) map to the bare root endpoint (/props).
@@ -62,7 +87,7 @@ class Proxy(http.server.BaseHTTPRequestHandler):
             path = path[3:]  # /v1/props -> /props
         attempts = 0
         while attempts < 2:
-            upstream = resolve_upstream(force=(attempts > 0))
+            upstream = resolve_upstream(slot, force=(attempts > 0))
             try:
                 fwd = {k: v for k, v in self.headers.items()
                        if k.lower() not in ("host", "content-length", "connection", "transfer-encoding")}
